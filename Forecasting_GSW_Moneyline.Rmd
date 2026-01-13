@@ -1,0 +1,375 @@
+---
+title: "Forecasting Golden State Warriors Moneyline Odds"
+author: "Hwan Cho"
+date: "2025-03-13"
+output: 
+  pdf_document:
+    latex_engine: xelatex
+---
+
+```{r libraries, echo = FALSE, warning = FALSE, message = FALSE}
+library(fImport)
+library(ggplot2)
+library(nlstools)
+library(tseries)
+library(Quandl)
+library(zoo)
+library(PerformanceAnalytics)
+library(quantmod)
+library(car)
+library(FinTS)
+library(forecast)
+require(stats)
+library(vars)
+library(tseries, quietly = T)
+library(forecast, quietly = T)
+library(XML)
+library(fBasics)
+library(timsac)
+library(TTR)
+library(lattice)
+library(foreign)
+library(MASS)
+require(stats4)
+library(KernSmooth)
+library(fastICA)
+library(cluster)
+library(leaps)
+library(mgcv)
+library(rpart)
+require("datasets")
+require(graphics)
+library(RColorBrewer)
+library(dynlm)
+library(tis)
+library(seasonal)
+library(fpp)
+library(dplyr)
+library(strucchange)  # Load package for stability test
+library(tibble)
+library(tidyr)
+library(prophet)
+```
+
+
+# Introduction
+
+My dataset is from Kaggle called NBA odds that depicts NBA money lines, game totals, spreads and second half totals for 2008-2023 regular season games (82 games per season). Since 2020 is incomplete due to COVID and 2023 season is also incomplete, I only considered from seasons 2008-2019. Furthermore, I focused on my favorite NBA team, Golden State Warriors (GSW) and their money lines. I changed GSW moneyline odds to probability of winning for easier interpretation and modeling. I fit 6 models including ARIMA, ETS, Holt-Winter, NNETAR, Prophet, and a combined model (combined 3 best models). 
+
+I wanted to investigate how historical betting odds can be used to predict future odds and illustrate that past behavior of the odds may reveal systematic patterns, trends, or seasonality—even in a competitive market like sports betting. Although this model is simplified compared to models owned by sports books, I wanted to hint at ideas of arbitrage. For example, if my forecasted probabilities differ significantly from those implied by current bookmaker odds, it could highlight potential value bets.
+
+
+```{r}
+data <- read.csv("oddsData.csv")
+
+unique(data$season)
+
+head(data)
+
+# only want to look at GSW games and remove season 2020 because only contains 32 games because it was postponed due ot COVID-19.
+
+GSW <- data %>%
+  dplyr::filter(team == "Golden State" & season != 2020) %>%
+  mutate(date = as.Date(date)) %>%
+  rename(GSW_moneyline = moneyLine, GSW_score = score, GSW_spread = spread) %>%
+  dplyr::select(date, season, team, home.visitor, opponent, GSW_score, opponentScore, GSW_moneyline, opponentMoneyLine, GSW_spread)
+
+# create game index
+
+GSW <- GSW %>%
+  group_by(season) %>%
+  mutate(game_number = row_number()) %>%
+  ungroup()
+
+convert_odds_to_prob <- function(odds) {
+  ifelse(odds > 0, 100 / (odds + 100), -odds / (-odds + 100))
+}
+
+# Create a season-game identifier (e.g., 2008_1 for Game 1 of 2007-08) & convert moneyline to probability
+
+GSW <- GSW %>%
+  mutate(season_game = paste0(season, "_", game_number)) %>%
+  mutate(probability = convert_odds_to_prob(GSW_moneyline))
+
+head(GSW)
+
+ts_GSW <- GSW %>%
+  dplyr::select(season, game_number, probability) %>%
+  tidyr::pivot_wider(names_from = game_number, values_from = probability) %>%
+  column_to_rownames("season") %>%
+  as.matrix() %>%
+  ts(frequency = 82)
+
+head(ts_GSW) # each row represents that season
+```
+
+
+# ARIMA Model
+
+Using our ARIMA Model, we find that differencing of 1 needed to account for trend, MA(2) model for the cycles, and AR(2) to account for the seasonality. We observe that in our ARIMA model's ACF, there are still some lags that are signficant, so not all dynamics are explained the model. When we look at the forecasts, we observe that since this is an MA model, the forecast was a horizontal line. Thus, looking at ETS, NNETAR, or Prophet explicitly account for trends and seasonality and typically produce non-flat forecasts when those patterns are present. The testing RMSE is 0.1696273, MAE is 0.1206004, and MAPE is 23.02255.
+
+```{r}
+
+# Create a long time series from the entire matrix (for visualization purposes)
+long_ts <- ts(as.vector(t(ts_GSW)), frequency = 82)
+
+# Training: Seasons 2008-2017 (rows 1 to 10)
+# Test: Seasons 2018-2019 (rows 11 and 12)
+train_seasons <- ts_GSW[1:10, ]
+test_seasons  <- ts_GSW[11:12, ]
+
+# Convert the training set to a long vector and then to a time series
+long_train <- as.vector(t(train_seasons))
+long_train_ts <- ts(long_train, frequency = 82, start = c(1, 1))  # start at "Season 1, Game 1"
+
+# Calculate the number of training observations
+n_train <- length(long_train_ts)
+
+# Compute the Correct Start for the Test Time Series
+# Since ts() expects start as a vector of (season, game) given frequency = 82,
+# we compute these from the total number of training observations.
+start_season <- floor(n_train / 82) + 1  # e.g., floor(820/82)+1 = 10+1 = 11
+start_game <- ifelse(n_train %% 82 == 0, 1, (n_train %% 82) + 1)
+# If training ends exactly at a season boundary, we start at game 1 of the next season.
+
+# Convert the test set to a long vector and then to a time series using the computed start
+
+# Convert the test set to a long vector and then to a time series.
+# We set the test series to start immediately after the training data.
+long_test <- as.vector(t(test_seasons))
+long_test_ts <- ts(long_test, frequency = 82, start = c(start_season, start_game))
+
+arima_model <- auto.arima(long_train_ts)
+summary(arima_model) # arima model is MA(2) with one difference to account for trend and cycles, and AR(1) for cycles
+
+# check residuals
+resid_arima <- residuals(arima_model)
+ggAcf(resid_arima) + ggtitle("ACF of ARIMA Residuals")
+ggPacf(resid_arima) + ggtitle("PACF of ARIMA Residuals")
+
+# Plot the training time series
+autoplot(long_train_ts) + 
+  ggtitle("Training Time Series (2008-2017)") +
+  xlab("Game Index") + ylab("GSW Winning Probability")
+
+# Plot the entire long time series (all seasons)
+autoplot(long_ts) +
+  ggtitle("Complete Long Time Series (2008-2019)") +
+  xlab("Game Index") + ylab("GSW Winning Probability")
+
+# Set forecast horizon equal to the number of test observations
+forecast_horizon <- length(long_test_ts)
+arima_forecast <- forecast(arima_model, h = forecast_horizon)
+
+# Plot the forecast alongside the actual test data
+autoplot(arima_forecast) +
+  autolayer(long_test_ts, series = "Test Data") +
+  ggtitle("ARIMA Forecast (Training: 2008-2017, Test: 2018-2019)") +
+  xlab("Game Index") + ylab("GSW Winning Probability")
+
+# Evaluate forecast accuracy (RMSE)
+accuracy_metrics <- accuracy(arima_forecast, long_test_ts)
+print(accuracy_metrics)
+```
+
+# ETS Model
+
+Since our frequency was too large, ETS ignored seasonality. I assumed that this is not too harmful for the model, because we are dealing with a MA model, so I continued with this approach and did not use stlf(). Like our ARIMA model, we observe that there are some lags in ACF and PACF that are signficant. Thus, our model doesn't fully capture all the dynamics. The RMSE is 0.1729378, MAE is 0.1212884, and MAPE is 23.45355 for our test set.
+
+```{r}
+ets_model <- ets(long_train_ts)
+summary(ets_model)
+
+tsdisplay(ets_model$residuals)
+
+forecast_horizon <- length(long_test_ts)
+ets_forecast <- forecast(ets_model, h = forecast_horizon)
+
+
+# Plot the ETS Forecast vs. Test Data
+autoplot(ets_forecast) +
+  autolayer(long_test_ts, series = "Test Data") +
+  ggtitle("ETS Forecast (Training: 2008-2017, Test: 2018-2019)") +
+  xlab("Game Index") +
+  ylab("GSW Winning Probability")
+
+# Evaluate Forecast Accuracy
+ets_accuracy <- accuracy(ets_forecast, long_test_ts)
+print(ets_accuracy)
+```
+
+# Holt Winter's Model
+
+Using our Holt Winter's Model, we first interpolated missing NA values. When looking at the acf and pacf of the residuals in the holt winter's model, we found that some ACF and PACF lags are significant indicating that not all dynamics are accounted for. The RMSE of the test set is 0.2071309, MAE is 0.1454064, and MAPE is 27.39466.
+
+```{r}
+# our time series has NA values, so we interpolate missing values
+
+if(any(is.na(long_train_ts))) {
+  message("Missing values found in long_train_ts. Interpolating missing values using na.interp().")
+  long_train_ts <- na.approx(long_train_ts)
+}
+
+hw_model <- HoltWinters(long_train_ts) # HoltWinters can't have NA values
+
+tsdisplay(residuals(hw_model))
+
+# Forecast Using Holt-Winters
+# Set forecast horizon equal to the number of observations in the test set
+forecast_horizon <- length(long_test_ts)
+hw_forecast <- forecast(hw_model, h = forecast_horizon)
+
+# Plot the Forecast vs. the Actual Test Data
+autoplot(hw_forecast) +
+  autolayer(long_test_ts, series = "Test Data") +
+  ggtitle("Holt-Winters Forecast (Training: 2008-2017, Test: 2018-2019)") +
+  xlab("Game Index") +
+  ylab("GSW Winning Probability")
+
+acf(hw_model$fitted[,1] - long_train_ts)
+pacf(hw_model$fitted[,1] - long_train_ts)
+
+# Evaluate Forecast Accuracy
+
+hw_accuracy <- accuracy(hw_forecast, long_test_ts)
+print(hw_accuracy)
+
+```
+
+# NNETAR model
+
+Using our NNETAR model, we find that all our ACF and PACF of residuals are within the confidence bounds, indicating that NNETAR model did a fairly excellent job explaining the dynamics in our model. The RMSE is 0.1820251, MAE is 0.12503591, and MAPE is 24.61647.
+
+```{r}
+nnetar_model <- nnetar(long_train_ts)
+summary(nnetar_model)
+
+tsdisplay(nnetar_model$residuals)
+
+forecast_horizon <- length(long_test_ts)
+nnetar_forecast <- forecast(nnetar_model, h = forecast_horizon)
+
+
+# Plot the Forecast vs. the Actual Test Data
+autoplot(nnetar_forecast) +
+  autolayer(long_test_ts, series = "Test Data") +
+  ggtitle("NNETAR Forecast (Training: 2008-2017, Test: 2018-2019)") +
+  xlab("Game Index") +
+  ylab("GSW Winning Probability")
+
+# Evaluate Forecast Accuracy
+accuracy_metrics <- accuracy(nnetar_forecast, long_test_ts)
+print(accuracy_metrics)
+
+```
+
+# Prophet Model
+
+In our prophet model, we found that the residuals in ACF and PACF exhibit many significant lags, indicating that prophet may not be a good fit to explain our model. Furthermore, prophet model has the highest RMSE at 0.3100337, MAE at 0.2489537, and MAPE at 43.69948.
+
+```{r}
+# Assume long_train_ts is your training time series (numeric vector)
+# and long_test_ts is your test series (numeric vector)
+# n_train and n_test represent their lengths respectively.
+n_train <- length(long_train_ts)
+n_test <- length(long_test_ts)
+
+# Prepare Training Data Frame for Prophet
+# Create a synthetic date sequence for the training period
+start_date <- as.Date("2008-10-01")  # Adjust as needed
+train_dates <- seq.Date(from = start_date, by = "day", length.out = n_train)
+
+# Build the training data frame for Prophet (ds = date, y = moneyline)
+prophet_train <- data.frame(ds = train_dates, y = as.numeric(long_train_ts))
+
+# Fit the Prophet Model
+prophet_model <- prophet(prophet_train)
+
+
+# Create a Future Data Frame and Forecast
+# This future data frame will contain dates for both training and test periods
+future <- make_future_dataframe(prophet_model, periods = n_test)
+prophet_forecast <- predict(prophet_model, future)
+
+train_forecast <- prophet_forecast[1:n_train, ]
+
+# Compute residuals: actual training values minus fitted values
+residuals_prophet <- prophet_train$y - train_forecast$yhat
+
+# Plot the ACF of the Residuals
+ggAcf(residuals_prophet) +
+  ggtitle("ACF of Prophet Model Residuals (Training Data)")
+
+
+# Plot the PACF of the Residuals
+ggPacf(residuals_prophet) +
+  ggtitle("PACF of Prophet Model Residuals (Training Data)")
+
+
+# Extract Forecasts for the Test Period
+# The forecast output contains predictions for the entire period.
+# The test forecasts are the rows after the training period.
+forecast_test <- prophet_forecast[(n_train + 1):(n_train + n_test), ]
+
+
+# Compute Forecast Accuracy Metrics
+# Actual test values from your series:
+actual_test <- as.numeric(long_test_ts)
+# Predicted values from Prophet:
+predicted_test <- forecast_test$yhat
+
+# Calculate error metrics:
+rmse <- sqrt(mean((actual_test - predicted_test)^2))
+mae  <- mean(abs(actual_test - predicted_test))
+mape <- mean(abs((actual_test - predicted_test) / actual_test)) * 100
+
+cat("Forecast Accuracy Metrics for Prophet Model:\n")
+cat("RMSE:", rmse, "\n")
+cat("MAE :", mae, "\n")
+cat("MAPE:", mape, "\n")
+
+
+# Plot the forecast
+plot(prophet_model, prophet_forecast) +
+  ggtitle("Prophet Forecast (Training & Test Periods)") +
+  xlab("Date") + ylab("GSW Winning Probability")
+
+```
+
+# Combined Model
+
+When looking at the three models I found ets, arima, and nnetar to provide the best forecasting using three metrics: RMSE, MAE, and MAPE. Thus, I combined the forecasts of the three models by averaging the means of each forecast. I found that the RMSE of the test set is 0.1731986, MAE is 0.1204005, and MAPE is 23.46671
+
+```{r}
+combined_forecast_mean <- (arima_forecast$mean + ets_forecast$mean + nnetar_forecast$mean) / 3
+
+# Create a combined forecast object. Here we copy the structure of one of the forecast objects.
+combined_forecast <- arima_forecast
+combined_forecast$mean <- combined_forecast_mean
+
+
+# Plot the Combined Forecast vs. the Actual Test Data
+autoplot(combined_forecast) +
+  autolayer(long_test_ts, series = "Test Data") +
+  ggtitle("Combined Forecast: ARIMA + ETS + NNETAR") +
+  xlab("Game Index") +
+  ylab("GSW Winning Probability")
+
+# Evaluate the Accuracy of the Combined Forecast
+accuracy_combined <- accuracy(combined_forecast, long_test_ts)
+print(accuracy_combined)
+```
+
+# Conclusion and References
+
+Among the five models I tested (ARIMA, ETS, Holt-Winters, NNETAR, and Prophet), ARIMA provided the lowest forecasting errors (RMSE, MAE, and MAPE). Even when I combined forecasts from multiple models, ARIMA alone still outperformed the combined approach. This finding is important because it shows that even in a seemingly complex and dynamic environment like sports betting, simpler models can sometimes yield superior forecasting performance. Moreover when converting raw moneyline odds into probabilities, it shows a clearer basis for evaluating betting value, potentially guiding better decision-making in sports betting contexts.
+
+Some limitations are present in our ARIMA model. All models tested including ARIMA are univariate, meaning that they do not consider external variables. Every model considers only past market conditions, and doesn't really capture future changes such as rule changes, trades, player injuries, etc. 
+
+
+dataset link- <https://www.kaggle.com/datasets/christophertreasure/nba-odds-data/data>
+
+
+
+
+
